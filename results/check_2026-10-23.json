@@ -1,0 +1,12 @@
+[
+  {
+    "id": "03_sum",
+    "status": "通过",
+    "ms": 0.0932,
+    "iters": 868,
+    "gbps": 180.2,
+    "pct_peak": 99.8,
+    "launch": 1,
+    "ideal_launch": 1
+  }
+]

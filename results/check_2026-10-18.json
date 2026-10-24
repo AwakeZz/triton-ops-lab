@@ -1,0 +1,12 @@
+[
+  {
+    "id": "02_copy",
+    "status": "通过",
+    "ms": 0.1893,
+    "iters": 425,
+    "gbps": 177.2,
+    "pct_peak": 98.2,
+    "launch": 1,
+    "ideal_launch": 1
+  }
+]

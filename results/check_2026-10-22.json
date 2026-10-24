@@ -1,0 +1,12 @@
+[
+  {
+    "id": "07_layernorm",
+    "status": "通过",
+    "ms": 0.1874,
+    "iters": 427,
+    "gbps": 179.1,
+    "pct_peak": 99.2,
+    "launch": 1,
+    "ideal_launch": 1
+  }
+]

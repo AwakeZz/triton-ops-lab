@@ -1,0 +1,40 @@
+[
+  {
+    "id": "01_add",
+    "status": "未实现"
+  },
+  {
+    "id": "02_copy",
+    "status": "通过",
+    "ms": 0.1892,
+    "iters": 425,
+    "gbps": 177.4,
+    "pct_peak": 98.3,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "03_sum",
+    "status": "未实现"
+  },
+  {
+    "id": "04_max",
+    "status": "未实现"
+  },
+  {
+    "id": "05_cumsum",
+    "status": "未实现"
+  },
+  {
+    "id": "06_softmax",
+    "status": "未实现"
+  },
+  {
+    "id": "07_layernorm",
+    "status": "未实现"
+  },
+  {
+    "id": "08_transpose",
+    "status": "未实现"
+  }
+]

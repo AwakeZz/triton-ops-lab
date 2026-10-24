@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>写第一个 Triton kernel — 以 copy 为例</title>
+<style>
+  :root {
+    --bg: #F7F7F5; --card: #FFF; --text: #1C1C1A; --text2: #5F5E5A; --text3: #8A8880;
+    --line: #E4E2DC; --ok: #0F6E56; --okbg: #E9F5F0; --warn: #854F0B; --warnbg: #FBF1DE;
+    --no: #A32D2D; --nobg: #FBECEC; --blue: #185FA5; --bluebg: #E9F1FA;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 15px; line-height: 1.75; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 56px 28px 80px; }
+  .kicker { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--text3); margin-bottom: 12px; }
+  h1 { font-size: 29px; line-height: 1.35; font-weight: 500; margin: 0 0 14px; letter-spacing: -.01em; }
+  .sub { color: var(--text2); margin: 0; max-width: 650px; }
+  h2 { font-size: 19px; font-weight: 500; margin: 50px 0 6px; }
+  h2 .num { color: var(--text3); margin-right: 10px; font-variant-numeric: tabular-nums; }
+  .lead { color: var(--text2); margin: 0 0 18px; }
+  p { margin: 14px 0; }
+  strong { font-weight: 500; }
+  pre { background: #1F1F1D; color: #E8E6E1; padding: 16px 18px; border-radius: 10px;
+    overflow-x: auto; font-size: 13px; line-height: 1.7; margin: 16px 0; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  p code, li code, td code { background: #EFEDE8; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14px; }
+  th { text-align: left; font-weight: 500; color: var(--text3); font-size: 12px; letter-spacing: .05em;
+    text-transform: uppercase; padding: 0 12px 10px 0; border-bottom: 1px solid var(--line); }
+  td { padding: 10px 12px 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.n { font-variant-numeric: tabular-nums; text-align: right; }
+  tbody tr:last-child td { border-bottom: none; }
+  .callout { border-radius: 0 8px 8px 0; padding: 14px 18px; margin: 20px 0; font-size: 14px; }
+  .callout.blue { background: var(--bluebg); border-left: 3px solid var(--blue); color: #17456F; }
+  .callout.warn { background: var(--warnbg); border-left: 3px solid var(--warn); color: #6B4A16; }
+  .callout.ok { background: var(--okbg); border-left: 3px solid var(--ok); color: #23564A; }
+  ul { padding-left: 20px; margin: 12px 0; }
+  li { margin: 7px 0; color: var(--text2); }
+  li strong { color: var(--text); }
+  .foot { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 13px; color: var(--text3); }
+  .bad { color: var(--no); font-weight: 500; }
+  .good { color: var(--ok); font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="kicker">Triton kernel 入门</div>
+<h1>写第一个 kernel：从 copy 开始</h1>
+<p class="sub">这份教程的目标不是让你会写 copy，而是让你建立三件事：<strong>执行模型的直觉、验证的方法、测量的纪律</strong>。后面 03–08 都用同一套东西。</p>
+
+<h2><span class="num">01</span>先建立执行模型</h2>
+<p class="lead">Triton 里你写的函数不是"一个线程干什么"，而是"<strong>一个 program 干什么</strong>"。</p>
+
+<p>你写一个 kernel，然后告诉它要开多少个 program（这就是 <code>grid</code>）。每个 program 拿到一个编号 <code>pid</code>，自己去数组里认领一段活。所有 program 同时跑。</p>
+
+<p>所以写任何一个 kernel，先回答两个问题：</p>
+<ul>
+  <li>整个问题要切成几份？→ 决定 <code>grid</code></li>
+  <li>每一份多大？→ 决定 <code>BLOCK</code></li>
+</ul>
+
+<div class="callout blue">
+<strong>和 CUDA 最大的区别：</strong>你没有 <code>threadIdx</code>、没有 warp、没有共享内存声明。<code>tl.arange(0, BLOCK)</code> 生成的是一整个<strong>向量</strong>，不是循环。你写的是"这批数据"，编译器决定怎么摊到 128 个线程上。
+</div>
+
+<h2><span class="num">02</span>六行代码，逐行拆</h2>
+<p class="lead">copy 的完整实现就是下面这个。其中 4 行是固定的套路，只有 <code>BLOCK</code> 是你要调的。</p>
+
+<pre><code>@triton.jit
+def copy_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid  = tl.program_id(0)                      # 我是第几个 program
+    offs = pid * BLOCK + tl.arange(0, BLOCK)     # 我负责哪一段
+    mask = offs &lt; n                              # 越界的 lane 屏蔽掉
+    v    = tl.load(x_ptr + offs, mask=mask)      # 一次搬整段
+    tl.store(out_ptr + offs, v, mask=mask)       # 一次写回去
+
+
+def run(x, out):
+    n = x.numel()
+    grid = (triton.cdiv(n, 4096),)
+    copy_kernel[grid](x, out, n, BLOCK=4096)</code></pre>
+
+<table>
+  <thead><tr><th>行</th><th>在干什么</th><th>错了会怎样</th></tr></thead>
+  <tbody>
+    <tr><td><code>program_id(0)</code></td><td>取第 0 维的 program 编号</td><td>二维 grid 时要 <code>(0)</code> 和 <code>(1)</code> 两个</td></tr>
+    <tr><td><code>pid * BLOCK</code></td><td>本段的起点（全局下标）</td><td>忘了乘 BLOCK，所有 program 都抢开头一小段</td></tr>
+    <tr><td><code>tl.arange(0, BLOCK)</code></td><td>段内偏移向量 <code>[0,1,...,BLOCK-1]</code></td><td>不能是变量，必须是编译期常量</td></tr>
+    <tr><td><code>mask = offs &lt; n</code></td><td>标记哪些 lane 是真实数据</td><td>漏了 → 越界读写，可能不报错但结果错</td></tr>
+    <tr><td><code>cdiv(n, BLOCK)</code></td><td>向上取整算 program 数</td><td>用整除 → 尾巴那一段永远没人处理</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+<strong>最容易犯的三个错，按踩坑频率排：</strong><br>
+1. <code>grid</code> 用了整除而不是 <code>cdiv</code> —— 数组尾部少算一截，结果看起来"大部分对"。<br>
+2. 忘了 <code>mask</code> —— 越界访问。GPU 不保证报错，可能给你一堆垃圾值。<br>
+3. 把 <code>n</code> 写成了 shape 的第一维 —— 二维张量要用 <code>numel()</code>，显存里是平铺的。
+</div>
+
+<h2><span class="num">03</span>验证：先对，再快</h2>
+<p class="lead">顺序不能反。一个跑得飞快的错误 kernel 毫无价值。</p>
+
+<pre><code># 1. 正确性
+check.py --only 02_copy
+
+# 2. 换个别扭的尺寸再验一遍
+check.py --only 02_copy --odd
+
+# 3. 调参
+tune_copy.py</code></pre>
+
+<div class="callout warn">
+<strong>为什么必须有第 2 步：常规 shape 会放过整除 bug。</strong><br>
+题库固定是 (4096, 1024)，总元素 4,194,304 <strong>恰好能被 BLOCK=4096 整除</strong>。
+所以 <code>grid = (n // 4096,)</code> 这种错写法也能"通过"——余数为 0，尾部根本不存在。
+实测换成别的尺寸立刻露：n=1,000,000 漏 576 个元素，n=1,000 时 <code>grid=0</code>，
+<strong>整个 kernel 都没启动</strong>，却依然不报错。<br>
+<code>--odd</code> 会用 (997, 1024)、(1003, 512)、(1, 4096) 这几组尺寸重验；
+<code>--odd hard</code> 再加 (333, 1000)、(77, 127)，把 N 也变成非 2 的幂——归约类 kernel 必须自己做 <code>next_power_of_2</code> + mask 才能过。
+</div>
+
+<p>正确性那一关框架会替你比（<code>torch.allclose</code>）。通过之后才看性能数字。第一次跑通的输出：</p>
+
+<pre><code>02_copy       通过          0.1893     177.2    98.2%       1       1</code></pre>
+
+<p>四列分别是：耗时、带宽、占峰值百分比、<strong>启动了 1 次 kernel（理想 1 次）</strong>。最后一组数字是重点——它直接告诉你走了几趟访存。</p>
+
+<h2><span class="num">04</span>调参：BLOCK 和 num_warps</h2>
+<p class="lead">我扫了 28 种组合，结论比你想的简单得多。</p>
+
+<table>
+  <thead><tr><th>BLOCK</th><th>num_warps</th><th>元素/线程</th><th class="n">GB/s</th><th class="n">%峰值</th></tr></thead>
+  <tbody>
+    <tr><td>256</td><td>8</td><td>1</td><td class="n">181.5</td><td class="n">100.6%</td></tr>
+    <tr><td>1024</td><td>2</td><td>16</td><td class="n">180.5</td><td class="n">100.0%</td></tr>
+    <tr><td>2048</td><td>2</td><td>32</td><td class="n">180.7</td><td class="n">100.1%</td></tr>
+    <tr><td>4096</td><td>4</td><td>32</td><td class="n">180.4</td><td class="n">100.0%</td></tr>
+    <tr><td>16384</td><td>4</td><td>128</td><td class="n">180.4</td><td class="n">100.0%</td></tr>
+    <tr><td>8192</td><td>1</td><td>256</td><td class="n bad">145.1</td><td class="n bad">80.4%</td></tr>
+    <tr><td>16384</td><td>2</td><td>256</td><td class="n bad">144.8</td><td class="n bad">80.2%</td></tr>
+    <tr><td>16384</td><td>1</td><td>512</td><td class="n bad">63.2</td><td class="n bad">35.0%</td></tr>
+  </tbody>
+</table>
+
+<p><strong>凡是正常配置，全是 180 GB/s 左右。掉下去只有一个原因：给太少线程扛太多元素。</strong></p>
+
+<p>判断方法是看"元素/线程"这一列：<code>BLOCK / (num_warps × 32)</code>。超过 128 就开始掉，到 512 直接腰斩再腰斩。因为每个线程要串行处理太多次，一次 load 的延迟还没藏住，下一次又来了。</p>
+
+<div class="callout ok">
+<strong>所以 elementwise kernel 没有优化空间。</strong>这不是你写得不好，是它本来就贴着 roofline。你随手写的 <code>BLOCK=4096, num_warps=4</code> 就已经到 100% 了——<strong>PyTorch 自己的 <code>copy_</code> 是 179.4 GB/s，你打平了</strong>。
+</div>
+
+<p>顺便验证了一个常见猜疑：<strong>去掉 mask 有没有用？没有。</strong></p>
+
+<table>
+  <thead><tr><th>BLOCK</th><th class="n">带 mask</th><th class="n">不带 mask</th><th class="n">差值</th></tr></thead>
+  <tbody>
+    <tr><td>1024</td><td class="n">179.8</td><td class="n">179.6</td><td class="n">−0.2</td></tr>
+    <tr><td>4096</td><td class="n">180.4</td><td class="n">180.4</td><td class="n">0.0</td></tr>
+    <tr><td>8192</td><td class="n">180.0</td><td class="n">180.0</td><td class="n">0.0</td></tr>
+  </tbody>
+</table>
+
+<p>原因是访存已经完全饱和，那点比较指令被藏在访存空隙里。<strong>这就是 roofline 的意义：先确认瓶颈在哪，再去优化那个东西。</strong>在访存受限的 kernel 上抠指令数，纯属白费力气。</p>
+
+<h2><span class="num">05</span>一个我亲自踩过的测量陷阱</h2>
+
+<div class="callout warn">
+<strong>第一版扫参，一半配置测出来是 18 GB/s，我差点写成"某些配置慢 10 倍"。</strong><br><br>
+真相是：<code>@triton.jit</code> 的<strong>第一次调用包含编译</strong>，要几百毫秒到几秒。我的预热是「跑满 0.7 秒」，结果编译把 0.7 秒全吃光了，GPU 从头到尾在搬数据、人还没开始计时——但<strong>显存时钟还停在待机频率</strong>，于是测出 18 GB/s。<br><br>
+修法是：<strong>第一次调用单独跑一次，排除在预热和计时之外</strong>。改完同一个配置从 18 变成 180.7。
+</div>
+
+<p>这条对你有两层用：</p>
+<ul>
+  <li>自己写测量脚本时，<strong>必须先做一次 warmup 调用把编译挡掉</strong>。</li>
+  <li>看到"某个配置异常慢"的第一反应，应该是怀疑测量，而不是相信结论。</li>
+</ul>
+
+<h2><span class="num">06</span>想知道编译器到底干了什么</h2>
+<p class="lead">不用猜，PTX 就在编译产物里。</p>
+
+<pre><code>k = copy_kernel.warmup(x, out, n, BLOCK=2048, num_warps=4, grid=(1,))
+print(k.asm["ptx"])          # 里面有 ld.global / st.global</code></pre>
+
+<p>看 load 的宽度就够了：</p>
+
+<table>
+  <thead><tr><th>元素/线程</th><th>生成的指令</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td>≥ 4</td><td><code>ld.global.v4.b32</code></td><td class="good">128 位向量化，一次搬 4 个 float</td></tr>
+    <tr><td>2</td><td><code>ld.global.v2.b32</code></td><td>64 位，一次 2 个</td></tr>
+    <tr><td>1</td><td><code>ld.global.b32</code></td><td class="bad">标量，一次 1 个 float</td></tr>
+  </tbody>
+</table>
+
+<p>这条对你后面写 <code>08_transpose</code> 极其关键：那个 kernel 的问题就出在<strong>某一边的访存宽度掉到标量、而且不连续</strong>，此时带宽会掉到 1/8。</p>
+
+<div class="callout blue">
+顺带一个坑：<code>@triton.jit</code> 的函数<strong>必须在真实 .py 文件里</strong>。写进 REPL、<code>python -c</code>、或者 stdin 管道都会报 <code>@jit functions should be defined in a Python file</code>——因为 Triton 要读源码做 AST 分析。
+</div>
+
+<h2><span class="num">07</span>API 速查</h2>
+
+<table>
+  <thead><tr><th>要干的事</th><th>写法</th></tr></thead>
+  <tbody>
+    <tr><td>取 program 编号</td><td><code>tl.program_id(0)</code> / <code>(1)</code></td></tr>
+    <tr><td>生成偏移向量</td><td><code>tl.arange(0, BLOCK)</code></td></tr>
+    <tr><td>读显存</td><td><code>tl.load(ptr + offs, mask=..., other=0.0)</code></td></tr>
+    <tr><td>写显存</td><td><code>tl.store(ptr + offs, v, mask=...)</code></td></tr>
+    <tr><td>降维归约</td><td><code>tl.sum(v, axis=0)</code> / <code>tl.max(v, axis=1)</code></td></tr>
+    <tr><td>前缀和</td><td><code>tl.cumsum(v, axis=1)</code></td></tr>
+    <tr><td>交换维度布局</td><td><code>tl.trans(v)</code></td></tr>
+    <tr><td>编译期常量参数</td><td><code>BLOCK: tl.constexpr</code></td></tr>
+    <tr><td>启动时指定线程数</td><td><code>kernel[grid](..., num_warps=4)</code></td></tr>
+    <tr><td>向上取整</td><td><code>triton.cdiv(n, BLOCK)</code></td></tr>
+  </tbody>
+</table>
+
+<h2><span class="num">08</span>现在该干什么</h2>
+
+<p>copy 已经能跑了，它现在的角色是<strong>尺子</strong>。从下一题开始，你自己写，写完全部丢给 <code>check.py</code>。</p>
+
+<ul>
+  <li><strong>01_add</strong>：多一个 <code>tl.load</code>，其他一模一样。五分钟的事。</li>
+  <li><strong>03_sum / 04_max</strong>：开始有意思了。<code>tl.sum(v, axis=0)</code> 把 BLOCK 压成一个数。真正的取舍是"一个 program 处理一行"还是"处理多行"——4096 个 program 抢 20 个 SM，你想想够不够。</li>
+  <li><strong>06_softmax</strong>：本组重点。朴素三趟读，一行装得进寄存器就只要一趟。</li>
+  <li><strong>08_transpose</strong>：回头看第 06 节的向量化表，这题就是围绕它出的。</li>
+</ul>
+
+<p>判断标准始终是两个数：<strong>占峰值百分比</strong>，和<strong>启动次数 vs 理想次数</strong>。</p>
+
+<div class="foot">
+实测数据来自本机 RTX 3050 Ti Laptop（sm_86 / 4GB / 20 SM），torch 2.11.0+cu128，Triton 3.8.0，2026-10-18。峰值带宽取实测值 180.5 GB/s，所以个别配置会显示 100.6%，属正常浮动。
+</div>
+
+</div>
+</body>
+</html>

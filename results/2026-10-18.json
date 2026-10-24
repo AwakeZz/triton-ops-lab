@@ -1,0 +1,93 @@
+{
+  "device": {
+    "name": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+    "cc": "8.6",
+    "vram_gib": 4.0,
+    "sm": 20,
+    "l2_mib": 2.0
+  },
+  "versions": {
+    "torch": "2.11.0+cu128",
+    "triton": "3.8.0"
+  },
+  "copy": [
+    {
+      "size_mb": 1.0,
+      "median_ms": 0.0061,
+      "best_ms": 0.0051,
+      "iters": 5000,
+      "gbps": 341.3,
+      "l2_resident": true,
+      "peak_pct": 177.8
+    },
+    {
+      "size_mb": 2.0,
+      "median_ms": 0.0264,
+      "best_ms": 0.0246,
+      "iters": 3195,
+      "gbps": 158.7,
+      "l2_resident": false,
+      "peak_pct": 82.7
+    },
+    {
+      "size_mb": 4.0,
+      "median_ms": 0.0492,
+      "best_ms": 0.0479,
+      "iters": 1655,
+      "gbps": 170.7,
+      "l2_resident": false,
+      "peak_pct": 88.9
+    },
+    {
+      "size_mb": 16.0,
+      "median_ms": 0.1894,
+      "best_ms": 0.1872,
+      "iters": 425,
+      "gbps": 177.2,
+      "l2_resident": false,
+      "peak_pct": 92.3
+    },
+    {
+      "size_mb": 64.0,
+      "median_ms": 0.7464,
+      "best_ms": 0.7422,
+      "iters": 107,
+      "gbps": 179.8,
+      "l2_resident": false,
+      "peak_pct": 93.6
+    },
+    {
+      "size_mb": 256.0,
+      "median_ms": 2.9745,
+      "best_ms": 2.9706,
+      "iters": 26,
+      "gbps": 180.5,
+      "l2_resident": false,
+      "peak_pct": 94.0
+    }
+  ],
+  "add": [
+    {
+      "size_mb": 16.0,
+      "median_ms": 0.2806,
+      "iters": 285,
+      "gbps": 179.4,
+      "gflops": 14.95
+    },
+    {
+      "size_mb": 64.0,
+      "median_ms": 1.1141,
+      "iters": 71,
+      "gbps": 180.7,
+      "gflops": 15.06
+    },
+    {
+      "size_mb": 256.0,
+      "median_ms": 4.443,
+      "iters": 20,
+      "gbps": 181.3,
+      "gflops": 15.1
+    }
+  ],
+  "ridge_flop_per_byte": 42.7
+}

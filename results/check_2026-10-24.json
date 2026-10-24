@@ -1,0 +1,82 @@
+[
+  {
+    "id": "01_add",
+    "status": "通过",
+    "ms": 0.2804,
+    "iters": 286,
+    "gbps": 179.5,
+    "pct_peak": 99.4,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "02_copy",
+    "status": "通过",
+    "ms": 0.1886,
+    "iters": 425,
+    "gbps": 177.9,
+    "pct_peak": 98.5,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "03_sum",
+    "status": "通过",
+    "ms": 0.0932,
+    "iters": 868,
+    "gbps": 180.2,
+    "pct_peak": 99.8,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "04_max",
+    "status": "通过",
+    "ms": 0.0932,
+    "iters": 868,
+    "gbps": 180.2,
+    "pct_peak": 99.8,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "05_cumsum",
+    "status": "通过",
+    "ms": 0.1874,
+    "iters": 429,
+    "gbps": 179.1,
+    "pct_peak": 99.2,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "06_softmax",
+    "status": "通过",
+    "ms": 0.1874,
+    "iters": 429,
+    "gbps": 179.1,
+    "pct_peak": 99.2,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "07_layernorm",
+    "status": "通过",
+    "ms": 0.1874,
+    "iters": 429,
+    "gbps": 179.1,
+    "pct_peak": 99.2,
+    "launch": 1,
+    "ideal_launch": 1
+  },
+  {
+    "id": "08_transpose",
+    "status": "通过",
+    "ms": 0.1902,
+    "iters": 422,
+    "gbps": 176.4,
+    "pct_peak": 97.7,
+    "launch": 1,
+    "ideal_launch": 1
+  }
+]
