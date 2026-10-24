@@ -1,7 +1,7 @@
 """
 算子练习验收框架。
 
-你只写 kernels/*.py 里的 kernel，这里负责：生成输入 → 比对正确性 → 测带宽 → 给 roofline 结论。
+你只写 kernels/*.py 里的 kernel，这里负责：生成输入 → 比对正确性 → 测性能 → 给 roofline 结论。
 
 用法:
     python check.py              # 跑全部
@@ -13,6 +13,12 @@
 --odd 会在常规 shape 之外再跑几组别扭的尺寸, 只验正确性和启动次数, 不测带宽。
 理由: 常规 shape 是 (4096, 1024), 总元素数恰好能被 BLOCK 整除,
 grid 写成 n // BLOCK 也能"通过"。非常规尺寸专门用来抓这类错。
+GEMM 题的尺寸是三元组 (M, N, K), 见 GEMM_ODD。
+
+两类题分开看指标:
+    01~08  elementwise / reduction / scan / transpose -> 访存受限, 看 GB/s
+    09~12  GEMM 四版                                  -> 计算受限, 看 TFLOPS
+    同一个 kernel 该盯哪个指标, 用 roofline 平衡点判断, 不是凭感觉。
 
 设计上故意不提供任何 kernel 实现。--selftest 里那几个是最平凡的版本，
 只用来确认框架逻辑没坏，不是给你抄的。
@@ -49,8 +55,18 @@ PEAK_GBPS = 180.5
 PEAK_TFLOPS = 8.2
 RIDGE = PEAK_TFLOPS * 1e12 / (PEAK_GBPS * 1e9)  # 45.4 FLOP/Byte, 用实测带宽算
 
+# ---- fp16 tensor core 实测峰值 (2026-10-24, 见 _probe_peak.py) ---------------
+# 按尺寸扫 1024/2048/3072/4096 最好成绩 18.2 TFLOPS (cuBLAS, 持续 1s 后取中位数)。
+# 官方规格是 40.7 TFLOPS, 只跑到 45% —— 笔记本功耗墙, SM 时钟撑不住。
+# 和 PEAK_GBPS 一样, 分母用本机实测值, 不用规格值。
+PEAK_TFLOPS_TC = 18.2
+
 M, N = 4096, 1024
+GM = GN = GK = 1024     # GEMM 的标准尺寸, 三方都是 1024
 DEV = "cuda"
+
+# 参考值必须是 fp32 精确算, 不能被 TF32 截断, 否则 GEMM 的正确性比对没意义
+torch.backends.cuda.matmul.allow_tf32 = False
 
 
 # ---- 统计 kernel 启动次数: 直接反映你的 kernel 走了几趟 ----------------------
@@ -67,22 +83,29 @@ JITFunction.run = _counting_run
 
 
 # ---- 计时 -------------------------------------------------------------------
-def bench(fn, target_total_ms=80.0, min_iters=20):
-    """测前先跑 0.8s 把时钟拉满, 迭代数按耗时自适应。笔记本必须这么做。"""
-    ramp_until = time.perf_counter() + 0.8
-    while time.perf_counter() < ramp_until:
+def bench(fn, target_total_ms=80.0, min_iters=20, ramp_ms=800):
+    """先预热把时钟拉满, 再按实测耗时自适应迭代数。笔记本 GPU 必须这么做。
+
+    预热次数按单次耗时反推, 不能写成"跑满 0.8 秒" —— launch 是异步的,
+    慢 kernel 在 0.8 秒墙钟里能往队列里塞进上千次 launch, 接下来那次
+    synchronize 就要等上几十分钟。09_gemm_naive 单次 0.475 秒, 这么卡死过一次。
+    """
+    fn()                      # 第一次调用含 JIT 编译, 排除在计时和预热之外
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    fn()
+    torch.cuda.synchronize()
+    single = max((time.perf_counter() - t0) * 1e3, 1e-3)   # 单次耗时, ms
+
+    warm = max(1, min(int(ramp_ms / single), 4000))
+    for _ in range(warm):
         fn()
     torch.cuda.synchronize()
 
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(5):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    est = max(s.elapsed_time(e) / 5, 1e-4)
-    iters = min(max(min_iters, int(target_total_ms / est)), 5000)
+    # 单次就超过 50 ms 的 kernel 不必强跑 20 次, 3 次取中位数已经够稳
+    floor = 3 if single > 50 else min_iters
+    iters = min(max(floor, int(target_total_ms / single)), 5000)
 
     samples = []
     for _ in range(iters):
@@ -118,12 +141,31 @@ def _mk_tp(m=M, n=N):
     return dict(x=x, out=torch.empty(n, m, device=DEV))
 
 
+def _mk_gemm(m=GM, n=GN, k=GK):
+    """A(m,k) fp16  x  B(k,n) fp16  ->  out(m,n) fp32
+
+    fp16 是因为 tl.dot 只有喂 fp16/bf16 才走 tensor core 的 mma 指令;
+    out 用 fp32 是因为累加器必须是 fp32, 顺便让正确性比对可以卡得紧一点。
+    """
+    a = torch.randn(m, k, device=DEV, dtype=torch.float16)
+    b = torch.randn(k, n, device=DEV, dtype=torch.float16)
+    return dict(a=a, b=b, out=torch.empty(m, n, device=DEV, dtype=torch.float32))
+
+
 # ---- 非常规尺寸 (--odd) ------------------------------------------------------
 # tail: N 仍是 2 的幂, 但行数凑不出 BLOCK 的整数倍 -> 专抓 "grid 用整除" 和尾部 mask
 # hard: N 也不是 2 的幂 -> 归约类 kernel 必须自己做 next_power_of_2 + mask
 TAIL_SHAPES = [(997, 1024), (1003, 512), (1, 4096)]
 HARD_SHAPES = [(333, 1000), (77, 127)]
 ODD_SHAPES = {"tail": TAIL_SHAPES, "hard": TAIL_SHAPES + HARD_SHAPES}
+
+# GEMM 的尺寸是三元组 (M, N, K)
+# tail: M/N/K 不是 BLOCK 的整数倍 -> 抓 tile 边界的 mask
+# hard: 再加大到小到 1、K 不是 2 的幂 -> 抓 K 方向尾块和退化尺寸
+GEMM_ODD = {
+    "tail": [(1000, 1000, 1024), (1024, 1024, 1000), (2048, 512, 768)],
+    "hard": [(1000, 1000, 1000), (17, 33, 65), (1, 1, 1024), (128, 128, 129)],
+}
 
 
 PROBLEMS = [
@@ -192,6 +234,46 @@ PROBLEMS = [
         ideal_launch=1, tol=(0.0, 0.0),
         note="读和写必有一边不连续。靠 tl.trans + 合适的 BLOCK 让两边都合并访存",
     ),
+    # ---- 以下四题是同一个 GEMM 的四次迭代, 形状相同, 看 TFLOPS 怎么爬 ----------
+    dict(
+        id="09_gemm_naive", file="09_gemm_naive.py", title="gemm (1 elem / prog)",
+        args=("a", "b", "out"), make=_mk_gemm,
+        ref=lambda t: t["a"].float() @ t["b"].float(),
+        ideal_flops=lambda t: 2 * t["a"].shape[0] * t["b"].shape[1] * t["a"].shape[1],
+        metric="tflops", shape=(GM, GN, GK), ideal_launch=1, tol=(1e-4, 1e-3),
+        odd_shapes=GEMM_ODD, target_pct=1,
+        note="这一版是故意的下限: 一个 program 一个元素, K 串行循环, 0 复用。"
+             "它的存在只是给后面三版当分母",
+    ),
+    dict(
+        id="10_gemm_tiled", file="10_gemm_tiled.py", title="gemm (tile, no dot)",
+        args=("a", "b", "out"), make=_mk_gemm,
+        ref=lambda t: t["a"].float() @ t["b"].float(),
+        ideal_flops=lambda t: 2 * t["a"].shape[0] * t["b"].shape[1] * t["a"].shape[1],
+        metric="tflops", shape=(GM, GN, GK), ideal_launch=1, tol=(1e-4, 1e-3),
+        odd_shapes=GEMM_ODD, target_pct=12,
+        note="tile 化 + K 方向分块累加, 但累加用广播外层积, 还是 FMA。"
+             "比 09 快 500 倍, 但离 tensor core 差 5 倍 —— 这就是第 11 题的理由",
+    ),
+    dict(
+        id="11_gemm_dot", file="11_gemm_dot.py", title="gemm (tl.dot)",
+        args=("a", "b", "out"), make=_mk_gemm,
+        ref=lambda t: t["a"].float() @ t["b"].float(),
+        ideal_flops=lambda t: 2 * t["a"].shape[0] * t["b"].shape[1] * t["a"].shape[1],
+        metric="tflops", shape=(GM, GN, GK), ideal_launch=1, tol=(1e-4, 1e-3),
+        odd_shapes=GEMM_ODD, target_pct=70,
+        note="把累加换成 tl.dot, 一下子进 tensor core。这一行就是 GEMM 和前面八题的分水岭",
+    ),
+    dict(
+        id="12_gemm_pipe", file="12_gemm_pipe.py", title="gemm (dot + pipeline)",
+        args=("a", "b", "out"), make=_mk_gemm,
+        ref=lambda t: t["a"].float() @ t["b"].float(),
+        ideal_flops=lambda t: 2 * t["a"].shape[0] * t["b"].shape[1] * t["a"].shape[1],
+        metric="tflops", shape=(GM, GN, GK), ideal_launch=1, tol=(1e-4, 1e-3),
+        odd_shapes=GEMM_ODD, target_pct=80,
+        note="同样的 tl.dot, 调 tile 尺寸 / num_warps / num_stages。"
+             "注意 tile 不是越大越好, 要看 grid 能不能填满 20 个 SM",
+    ),
 ]
 
 PROB_BY_ID = {p["id"]: p for p in PROBLEMS}
@@ -206,7 +288,7 @@ def load_module(path: Path):
 
 
 def run_one(p, mod=None, shape=None, benchmark=True):
-    t = p["make"](*(shape or (M, N)))
+    t = p["make"](*(shape or p.get("shape", (M, N))))
     ref = p["ref"](t)  # 先算参考值, 防止 kernel 就地改写输入
     out = t["out"]
     args = [t[a] for a in p["args"]]
@@ -242,6 +324,16 @@ def run_one(p, mod=None, shape=None, benchmark=True):
                     ideal_launch=p["ideal_launch"])
 
     ms, iters = bench(lambda: kern(*args))
+
+    if p.get("metric") == "tflops":
+        tflops = p["ideal_flops"](t) / (ms * 1e-3) / 1e12
+        return dict(
+            id=p["id"], status="通过", ms=round(ms, 4), iters=iters,
+            tflops=round(tflops, 4),
+            pct_peak=round(tflops / PEAK_TFLOPS_TC * 100, 1),
+            launch=launch, ideal_launch=p["ideal_launch"],
+        )
+
     ideal_bytes = p["ideal_bytes"](t)
     gbps = ideal_bytes / (ms * 1e-3) / 1e9
     return dict(
@@ -293,23 +385,23 @@ def run_odd(plist, level):
     """非常规尺寸检测: 只验正确性 + 启动次数, 不测带宽。
     返回失败数, 0 表示全通过。
     """
-    shapes = ODD_SHAPES[level]
     print(f"\n非常规尺寸检测 ({level})  只验正确性和启动次数, 不测带宽\n")
-    head = (pad("题目", 14) + pad("尺寸", 15) + pad("状态", 10)
+    head = (pad("题目", 14) + pad("尺寸", 19) + pad("状态", 10)
             + pad("启动", 6, True) + pad("理想", 6, True))
     print(head)
     print("-" * (_dw(head) + 2))
 
     fails = []
     for p in plist:
+        shapes = p.get("odd_shapes", ODD_SHAPES)[level]
         path = KDIR / p["file"]
         if not path.exists():
-            print(pad(p["id"], 14) + pad("-", 15) + "缺文件")
+            print(pad(p["id"], 14) + pad("-", 19) + "缺文件")
             continue
         try:
             mod = load_module(path)
         except Exception as exc:
-            print(pad(p["id"], 14) + pad("-", 15) + pad("导入失败", 10)
+            print(pad(p["id"], 14) + pad("-", 19) + pad("导入失败", 10)
                   + f"  {type(exc).__name__}: {exc}")
             fails.append(p["id"])
             continue
@@ -317,15 +409,15 @@ def run_odd(plist, level):
         skipped = False
         for sh in shapes:
             r = run_one(p, mod, shape=sh, benchmark=False)
-            tag = f"({sh[0]}, {sh[1]})"
+            tag = "(" + ", ".join(str(v) for v in sh) + ")"
             if r["status"] == "通过":
-                print(pad(r["id"], 14) + pad(tag, 15) + pad("通过", 10)
+                print(pad(r["id"], 14) + pad(tag, 19) + pad("通过", 10)
                       + pad(r["launch"], 6, True) + pad(r["ideal_launch"], 6, True))
             elif r["status"] == "未实现" and not skipped:
-                print(pad(r["id"], 14) + pad(tag, 15) + pad("未实现", 10))
+                print(pad(r["id"], 14) + pad(tag, 19) + pad("未实现", 10))
                 skipped = True
             elif not skipped:
-                print(pad(r["id"], 14) + pad(tag, 15) + pad(r["status"], 10)
+                print(pad(r["id"], 14) + pad(tag, 19) + pad(r["status"], 10)
                       + f"  {r.get('note', '')}")
                 if r.get("tb"):
                     print(r["tb"])
@@ -339,6 +431,73 @@ def run_odd(plist, level):
         return len(fails)
     print("非常规尺寸全部通过")
     return 0
+
+
+def _fmt_tf(v):
+    """0.0045 这种小值用两位小数会被抹成 0.00, 09_gemm_naive 正好踩这个。"""
+    return f"{v:.4f}" if v < 1 else f"{v:.2f}"
+
+
+def _row_line(r, metric):
+    val = _fmt_tf(r["tflops"]) if metric == "tflops" else f"{r['gbps']:.1f}"
+    return (pad(r["id"], 14) + pad("通过", 10)
+            + pad(f"{r['ms']:.4f}", 10, True) + pad(val, 10, True)
+            + pad(f"{r['pct_peak']:.1f}%", 9, True)
+            + pad(r["launch"], 8, True) + pad(r["ideal_launch"], 8, True))
+
+
+def _print_group(plist, metric, rows):
+    """按指标分表打印。访存类看 GB/s, 计算类看 TFLOPS, 混在一张表里没法读。"""
+    sub = [p for p in plist if p.get("metric", "gbps") == metric]
+    if not sub:
+        return
+    title = ("计算类 (compute-bound) · 分母 = fp16 tensor core 实测 "
+             f"{PEAK_TFLOPS_TC} TFLOPS") if metric == "tflops" else \
+            ("访存类 (memory-bound) · 分母 = 实测带宽 "
+             f"{PEAK_GBPS} GB/s")
+    print(f"\n【{title}】")
+    col = "TFLOPS" if metric == "tflops" else "GB/s"
+    head = (pad("题目", 14) + pad("状态", 10) + pad("ms", 10, True)
+            + pad(col, 10, True) + pad("%峰值", 9, True)
+            + pad("启动", 8, True) + pad("理想", 8, True))
+    print(head)
+    print("-" * (_dw(head) + 2))
+
+    for p in sub:
+        path = KDIR / p["file"]
+        if not path.exists():
+            print(pad(p["id"], 14) + pad("缺文件", 10))
+            continue
+        try:
+            mod = load_module(path)
+        except Exception as exc:
+            print(pad(p["id"], 14) + pad("导入失败", 10) + f"  {type(exc).__name__}: {exc}")
+            continue
+        r = run_one(p, mod)
+        rows.append(r)
+        if r["status"] == "通过":
+            print(_row_line(r, metric))
+        else:
+            print(pad(r["id"], 14) + pad(r["status"], 10) + f"  {r.get('note', '')}")
+            if r.get("tb"):
+                print(r["tb"])
+    print("-" * (_dw(head) + 2))
+
+
+def _cublas_ms(t):
+    """cuBLAS 在同样输入下的耗时, 输出缓冲预分配, 避免把 malloc 算进计时。"""
+    key = (t["a"].shape, t["b"].shape)
+    buf = _CBUF.get(key)
+    if buf is None:
+        buf = _CBUF[key] = torch.empty(t["a"].shape[0], t["b"].shape[1],
+                                       device=DEV, dtype=torch.float16)
+    fn = lambda: torch.matmul(t["a"], t["b"], out=buf)
+    fn()
+    torch.cuda.synchronize()
+    return bench(fn)[0]
+
+
+_CBUF = {}
 
 
 def main():
@@ -362,47 +521,39 @@ def main():
         KDIR.mkdir(parents=True)
     plist = [PROB_BY_ID[a.only]] if a.only else PROBLEMS
 
-    print(f"基线: {PEAK_GBPS} GB/s, 平衡点 {RIDGE:.1f} FLOP/Byte\n")
-    head = (pad("题目", 14) + pad("状态", 10) + pad("ms", 10, True)
-            + pad("GB/s", 10, True) + pad("%峰值", 9, True)
-            + pad("启动", 8, True) + pad("理想", 8, True))
-    print(head)
-    print("-" * (_dw(head) + 2))
+    print(f"基线: 带宽 {PEAK_GBPS} GB/s, FP32 {PEAK_TFLOPS} TFLOPS, "
+          f"fp16 tensor core {PEAK_TFLOPS_TC} TFLOPS, 平衡点 {RIDGE:.1f} FLOP/Byte")
 
     rows = []
-    for p in plist:
-        path = KDIR / p["file"]
-        if not path.exists():
-            print(pad(p["id"], 14) + pad("缺文件", 10))
-            continue
-        try:
-            mod = load_module(path)
-        except Exception as exc:
-            print(pad(p["id"], 14) + pad("导入失败", 10) + f"  {type(exc).__name__}: {exc}")
-            continue
-        r = run_one(p, mod)
-        rows.append(r)
-        if r["status"] == "通过":
-            print(pad(r["id"], 14) + pad("通过", 10)
-                  + pad(f"{r['ms']:.4f}", 10, True) + pad(f"{r['gbps']:.1f}", 10, True)
-                  + pad(f"{r['pct_peak']:.1f}%", 9, True)
-                  + pad(r["launch"], 8, True) + pad(r["ideal_launch"], 8, True))
-        else:
-            print(pad(r["id"], 14) + pad(r["status"], 10) + f"  {r.get('note', '')}")
-            if r.get("tb"):
-                print(r["tb"])
+    _print_group(plist, "gbps", rows)
+    _print_group(plist, "tflops", rows)
 
-    print("-" * (_dw(head) + 2))
     passed = [r for r in rows if r["status"] == "通过"]
-    print(f"通过 {len(passed)}/{len(plist)}")
+    print(f"\n通过 {len(passed)}/{len(plist)}")
     for r in passed:
+        p = PROB_BY_ID[r["id"]]
         if r["launch"] > r["ideal_launch"]:
-            p = PROB_BY_ID[r["id"]]
             print(f"  · {r['id']}: 启动 {r['launch']} 次, 理想 {r['ideal_launch']} 次 → "
                   f"多走了 {r['launch'] - r['ideal_launch']} 趟访存, 这就是优化空间")
-        if r["pct_peak"] < 85:
-            p = PROB_BY_ID[r["id"]]
+        if r["pct_peak"] < p.get("target_pct", 85):
             print(f"  · {r['id']}: 只有 {r['pct_peak']}% 峰值 —— {p['note']}")
+
+    # GEMM 单独给一行 cuBLAS 对照, 这是唯一能和工业实现直接比的题
+    gemm_rows = [r for r in passed if PROB_BY_ID[r["id"]].get("metric") == "tflops"]
+    if gemm_rows:
+        print("\n与 cuBLAS 对照 (同尺寸、同 dtype, 输出缓冲预分配):")
+        for r in gemm_rows:
+            p = PROB_BY_ID[r["id"]]
+            t = p["make"](*p.get("shape", (M, N)))
+            tms = _cublas_ms(t)
+            ttf = p["ideal_flops"](t) / (tms * 1e-3) / 1e12
+            rel = tms / r["ms"]
+            verdict = "超过" if rel > 1 else "落后"
+            print(f"  · {r['id']}: cuBLAS {tms:.4f} ms ({_fmt_tf(ttf)} TFLOPS) | "
+                  f"你 {r['ms']:.4f} ms ({_fmt_tf(r['tflops'])} TFLOPS) → "
+                  f"{verdict} {abs(1 - rel) * 100:.0f}%")
+            del t
+            torch.cuda.empty_cache()
 
     if passed:
         RESULT_DIR.mkdir(exist_ok=True)
